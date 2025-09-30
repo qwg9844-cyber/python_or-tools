@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CP-SAT 학급 편성 (200명, 6개 반) - '평균 성적 균형' 최적화 목적 포함
+
+주요 특징
+- 반 정원: [33,33,33,33,34,34] 정확히 맞춤
+- 관계: 나쁜관계(같은 반 금지), 좋은관계(같은 반 강제)
+- 리더십: 각 반 최소 1명(부족 시 슬랙으로 완화 후 페널티 최소화)
+- 균등 분배(하한/상한) + 완화(슬랙, 패널티 최소화): 남/녀, 피아노, 비등교, 운동, 전년도 학급, 클럽
+- 성적: '반 평균'이 전교 평균에 가깝도록, 각 반의 총점이 타깃 총점(=전교 평균×정원)에 가깝게
+  -> 반별 절대편차의 최대값(minimax)을 1차 목적, 슬랙합을 2차 목적(가중합)으로 최소화
+
+실행 예시
+    pip install ortools pandas
+    python class_assignment_cpsat_balanced_avg.py --in "학급반편성CSP 문제 입력파일.xlsx" --outdir out --time_limit 120
+    # CSV도 지원: --in "...csv"
+옵션
+    --time_limit 120      # 초 단위 타임리밋
+    --no_relax            # 균등분배 제약을 하드(완화 없이)로 강제 (기본은 소프트=완화 켬)
+    --log                 # 탐색 로그 출력
+"""
+
+import argparse, os
+import pandas as pd
+from collections import Counter
+from ortools.sat.python import cp_model
+
+SIZES_DEFAULT = (33,33,33,33,34,34)
+
+def fair_bounds(total, k):
+    base = total // k
+    extra = total % k
+    lows = [base]*(k-extra) + [base+1]*extra
+    highs = lows[:]  # 정확균등 분배 목표
+    return lows, highs
+
+def load_dataset(path: str) -> pd.DataFrame:
+    if path.lower().endswith(".csv"):
+        df = pd.read_csv(path, encoding="utf-8")
+    else:
+        df = pd.read_excel(path)
+
+    # 열 매핑
+    rename_map = {
+        "sex":"sex", "성별":"sex",
+        "score":"score", "점수":"score", "성적":"score",
+        "24년 학급":"prev_class", "작년학급":"prev_class",
+        "클럽":"club", "부활동":"club",
+        "좋은관계":"buddy", "누가 누구를 잘 챙겨준다":"buddy",
+        "나쁜관계":"enemy", "누구랑 사이 나쁘다":"enemy",
+        "Leadership":"Leadership", "리더쉽":"Leadership","리더십":"Leadership",
+        "Piano":"Piano", "피아노":"Piano",
+        "비등교":"Truancy", "비등교 성향이 있다":"Truancy",
+        "운동선호":"Sport", "운동을 잘한다":"Sport",
+        "id":"id", "ID":"id", "학번":"id",
+        "name":"name", "이름":"name",
+    }
+    for col in list(df.columns):
+        if col in rename_map:
+            df.rename(columns={col:rename_map[col]}, inplace=True)
+
+    # 기대 열 채우기
+    required = ["id","name","sex","score","prev_class","club","buddy","enemy","Leadership","Piano","Truancy","Sport"]
+    for col in required:
+        if col not in df.columns:
+            df[col] = None
+
+    # 정규화
+    def yes(x):
+        return str(x).strip().lower() in ("1","y","yes","true","t","ㅇ","예","네")
+    df["is_leader"]  = df["Leadership"].map(yes)
+    df["is_piano"]   = df["Piano"].map(yes)
+    df["is_truancy"] = df["Truancy"].map(yes)
+    df["is_sport"]   = df["Sport"].map(yes)
+    df["gender"] = df["sex"].map(lambda s: "M" if str(s).lower().strip()=="boy" else ("F" if str(s).lower().strip()=="girl" else "U"))
+
+    # 타입 보정
+    try: df["id"] = df["id"].astype(int)
+    except: pass
+    df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0).astype(int)
+
+    return df
+
+def build_and_solve(
+    df: pd.DataFrame,
+    outdir: str,
+    sizes=SIZES_DEFAULT,
+    time_limit: float = 120.0,
+    relax: bool = True,
+    log: bool = False,
+):
+    os.makedirs(outdir, exist_ok=True)
+    n_classes = len(sizes)
+    C = list(range(n_classes))
+
+    ids = df["id"].tolist()
+    I = list(range(len(ids)))
+    idx_of = {sid:i for i,sid in enumerate(ids)}
+
+    # 관계
+    buddy_pairs, enemy_pairs = set(), set()
+    for _, r in df.iterrows():
+        sid = r["id"]
+        try:
+            b = int(r.get("buddy"))
+            if b in idx_of: buddy_pairs.add(tuple(sorted((sid, b))))
+        except: pass
+        try:
+            e = int(r.get("enemy"))
+            if e in idx_of: enemy_pairs.add(tuple(sorted((sid, e))))
+        except: pass
+
+    # 속성 그룹
+    leaders = set(df.loc[df["is_leader"], "id"].tolist())
+    pianos  = set(df.loc[df["is_piano"],  "id"].tolist())
+    truants = set(df.loc[df["is_truancy"],"id"].tolist())
+    sports  = set(df.loc[df["is_sport"],  "id"].tolist())
+    males   = set(df.loc[df["gender"]=="M","id"].tolist())
+    females = set(df.loc[df["gender"]=="F","id"].tolist())
+
+    # 분류 항목(전년도/클럽)
+    prev_classes = sorted(df["prev_class"].astype(str).unique())
+    clubs        = sorted(df["club"].astype(str).fillna("None").unique())
+
+    # 성적/타깃 총점
+    scores = df["score"].tolist()
+    total_score_all = int(sum(scores))
+    num_students = len(ids)
+    target_total = [ (total_score_all * sizes[c]) // num_students for c in C ]
+
+    # 공평 분배 경계
+    def bounds_for(member_ids):
+        total = len(member_ids)
+        return fair_bounds(total, n_classes)
+
+    M_low, M_high         = bounds_for(males)
+    F_low, F_high         = bounds_for(females)
+    piano_low, piano_high = bounds_for(pianos)
+    tru_low, tru_high     = bounds_for(truants)
+    sport_low, sport_high = bounds_for(sports)
+
+    prev_low, prev_high = {}, {}
+    for pc in prev_classes:
+        members = set(df.loc[df["prev_class"].astype(str)==pc, "id"].tolist())
+        prev_low[pc], prev_high[pc] = bounds_for(members)
+
+    club_low, club_high = {}, {}
+    for cl in clubs:
+        members = set(df.loc[df["club"].astype(str)==cl, "id"].tolist())
+        club_low[cl], club_high[cl] = bounds_for(members)
+
+    # 모델
+    model = cp_model.CpModel()
+
+    # 변수: x[i,c] ∈ {0,1}
+    x = {(i,c): model.NewBoolVar(f"x_{ids[i]}_{c}") for i in I for c in C}
+
+    # 각 학생은 정확히 1개 반
+    for i in I:
+        model.Add(sum(x[(i,c)] for c in C) == 1)
+
+    # 반별 정원
+    for c in C:
+        model.Add(sum(x[(i,c)] for i in I) == sizes[c])
+
+    # 적대(같은 반 금지)
+    for (a,b) in enemy_pairs:
+        ia, ib = idx_of[a], idx_of[b]
+        for c in C:
+            model.Add(x[(ia,c)] + x[(ib,c)] <= 1)
+
+    # 친구(같은 반 강제)
+    for (a,b) in buddy_pairs:
+        ia, ib = idx_of[a], idx_of[b]
+        for c in C:
+            model.Add(x[(ia,c)] == x[(ib,c)])
+
+    # 리더: 각 반 >=1 (부족 시 완화)
+    leader_idx = [idx_of[sid] for sid in ids if sid in leaders]
+    leader_slacks = []
+    for c in C:
+        if leader_idx:
+            cnt = sum(x[(i,c)] for i in leader_idx)
+            slack = model.NewIntVar(0, len(leader_idx), f"leader_slack_c{c}")
+            model.Add(cnt + slack >= 1)
+            leader_slacks.append(slack)
+        else:
+            slack = model.NewIntVar(1, 1, f"leader_slack_c{c}")
+            leader_slacks.append(slack)
+
+    # 균등 분배(soft/hard)
+    slacks = []
+
+    def add_balancing(name, members_set, lows, highs):
+        m_idx = [idx_of[sid] for sid in ids if sid in members_set]
+        if not m_idx: return
+        for c in C:
+            cnt = sum(x[(i,c)] for i in m_idx)
+            lo, hi = lows[c], highs[c]
+            if not relax:
+                model.Add(cnt >= lo)
+                model.Add(cnt <= hi)
+            else:
+                over  = model.NewIntVar(0, len(m_idx), f"{name}_over_c{c}")
+                under = model.NewIntVar(0, len(m_idx), f"{name}_under_c{c}")
+                model.Add(cnt - hi <= over)
+                model.Add(lo - cnt <= under)
+                slacks.extend([over, under])
+
+    add_balancing("male",   males,   M_low, M_high)
+    add_balancing("female", females, F_low, F_high)
+    add_balancing("piano",  pianos,  piano_low, piano_high)
+    add_balancing("truancy",truants, tru_low, tru_high)
+    add_balancing("sport",  sports,  sport_low, sport_high)
+    for pc in prev_classes:
+        members = set(df.loc[df["prev_class"].astype(str)==pc, "id"].tolist())
+        add_balancing(f"prev_{pc}", members, prev_low[pc], prev_high[pc])
+    for cl in clubs:
+        members = set(df.loc[df["club"].astype(str)==cl, "id"].tolist())
+        add_balancing(f"club_{cl}", members, club_low[cl], club_high[cl])
+
+    # 반별 총점, 평균편차 minimax
+    score_sum_upper = total_score_all
+    class_total = []
+    for c in C:
+        s = model.NewIntVar(0, score_sum_upper, f"class_total_{c}")
+        model.Add(s == sum(x[(i,c)] * scores[i] for i in I))
+        class_total.append(s)
+
+    abs_devs = []
+    for c in C:
+        diff    = model.NewIntVar(-score_sum_upper, score_sum_upper, f"diff_c{c}")
+        absdiff = model.NewIntVar(0, score_sum_upper, f"absdiff_c{c}")
+        model.Add(diff == class_total[c] - int(target_total[c]))
+        model.AddAbsEquality(absdiff, diff)
+        abs_devs.append(absdiff)
+
+    max_abs_dev = model.NewIntVar(0, score_sum_upper, "max_abs_dev")
+    model.AddMaxEquality(max_abs_dev, abs_devs)
+
+    # 목적: (1) 평균편차 minimax  +  (2) 리더/균등 슬랙 합 최소화
+    W1 = 1_000_000   # 평균편차(최대) 우선
+    W_L = 20         # 리더 슬랙
+    W2 = 1           # 균등분배 슬랙
+    model.Minimize(W1 * max_abs_dev + W_L * sum(leader_slacks) + W2 * sum(slacks))
+
+    # 풀이
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = float(time_limit)
+    solver.parameters.num_search_workers  = max(1, os.cpu_count() or 8)
+    if log:
+        solver.parameters.log_search_progress = True
+
+    status = solver.Solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise RuntimeError(f"해를 찾지 못했습니다: {solver.StatusName(status)}")
+
+    # 결과 구성
+    cls_name = {c: f"Class_{c+1}" for c in C}
+    rows = []
+    for i, sid in enumerate(ids):
+        c_assigned = None
+        for c in C:
+            if solver.Value(x[(i,c)]) == 1:
+                c_assigned = c; break
+        r = df.loc[df["id"]==sid].iloc[0]
+        rows.append({
+            "class": cls_name[c_assigned],
+            "id": sid,
+            "name": r.get("name",""),
+            "sex": r.get("sex",""),
+            "score": int(r.get("score",0)),
+            "prev_class_24": r.get("prev_class",""),
+            "club": r.get("club",""),
+            "leader": "Y" if r.get("is_leader", False) else "",
+            "piano": "Y" if r.get("is_piano", False) else "",
+            "truancy": "Y" if r.get("is_truancy", False) else "",
+            "sport": "Y" if r.get("is_sport", False) else "",
+        })
+    assign_df = pd.DataFrame(rows).sort_values(["class","id"]).reset_index(drop=True)
+
+    # 요약
+    summary = []
+    for c in C:
+        mem_ids = assign_df.loc[assign_df["class"]==cls_name[c], "id"].tolist()
+        st = {
+            "class": cls_name[c],
+            "size": len(mem_ids),
+            "leaders": int(assign_df[(assign_df["class"]==cls_name[c]) & (assign_df["leader"]=="Y")].shape[0]),
+            "pianos":  int(assign_df[(assign_df["class"]==cls_name[c]) & (assign_df["piano"]=="Y")].shape[0]),
+            "truancy": int(assign_df[(assign_df["class"]==cls_name[c]) & (assign_df["truancy"]=="Y")].shape[0]),
+            "sport":   int(assign_df[(assign_df["class"]==cls_name[c]) & (assign_df["sport"]=="Y")].shape[0]),
+            "M": int((df.set_index("id").loc[mem_ids]["sex"].astype(str).str.lower()=="boy").sum()),
+            "F": int((df.set_index("id").loc[mem_ids]["sex"].astype(str).str.lower()=="girl").sum()),
+        }
+        # 적대 충돌 수
+        ecount = 0
+        for i1 in range(len(mem_ids)):
+            for j1 in range(i1+1,len(mem_ids)):
+                a, b = mem_ids[i1], mem_ids[j1]
+                if tuple(sorted((a,b))) in enemy_pairs:
+                    ecount += 1
+        st["enemy_conflicts"] = ecount
+
+        # 전년도/클럽 분포
+        prev_counts = df.set_index("id").loc[mem_ids]["prev_class"].astype(str).value_counts().to_dict()
+        for pc in prev_classes:
+            st[f"prev_{pc}"] = prev_counts.get(pc, 0)
+        club_counts = df.set_index("id").loc[mem_ids]["club"].astype(str).value_counts().to_dict()
+        for cl in clubs:
+            st[f"club_{cl}"] = club_counts.get(cl, 0)
+
+        # 총점/평균/타깃편차
+        class_scores = df.set_index("id").loc[mem_ids]["score"].tolist()
+        st["total_score"] = int(sum(class_scores))
+        st["target_total"] = int(target_total[c])
+        st["avg_score"] = float(st["total_score"] / max(1,len(mem_ids)))
+        st["abs_dev_from_target"] = abs(st["total_score"] - st["target_total"])
+        summary.append(st)
+
+    # 저장
+    assign_path  = os.path.join(outdir, "assignment_solution.csv")
+    summary_path = os.path.join(outdir, "assignment_summary.csv")
+    assign_df.to_csv(assign_path, index=False, encoding="utf-8-sig")
+    pd.DataFrame(summary).to_csv(summary_path, index=False, encoding="utf-8-sig")
+
+    # 콘솔 정보
+    print("=== Solve Info ===")
+    print("status:", solver.StatusName(status))
+    print("objective:", solver.ObjectiveValue())
+    print("max_abs_dev (avg-balance):", solver.Value(max_abs_dev))
+    print("leader_slack_sum:", sum(solver.Value(s) for s in leader_slacks))
+    print("balance_slack_sum:", sum(solver.Value(s) for s in slacks))
+    print("Saved:", assign_path)
+    print("Saved:", summary_path)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in", dest="inpath", required=True, help="입력 CSV/Excel 경로")
+    ap.add_argument("--outdir", default="./out", help="출력 디렉토리")
+    ap.add_argument("--time_limit", type=float, default=120.0, help="CP-SAT 타임리밋(초)")
+    ap.add_argument("--no_relax", action="store_true", help="균등분배를 하드 제약으로 강제(기본은 완화 켬)")
+    ap.add_argument("--log", action="store_true", help="탐색 로그 출력")
+    args = ap.parse_args()
+
+    relax = not args.no_relax
+    df = load_dataset(args.inpath)
+    build_and_solve(df, args.outdir, SIZES_DEFAULT, args.time_limit, relax, args.log)
+
+if __name__ == "__main__":
+    main()
